@@ -378,7 +378,14 @@ static void embed(Engine & e, const json & req) {
     const int n_embd = llama_model_n_embd_out(e.model);
     const int n_batch = (int) llama_n_batch(e.ctx), n_seq = (int) llama_n_seq_max(e.ctx);
     const int marks = (int) (e.head.size() + e.tail.size());
-    const int limit = std::max(marks + 1, std::min({req.value("max_tokens", 512), n_batch, (int) llama_model_n_ctx_train(e.model)}));
+    const int64_t asked = req.value("max_tokens", (int64_t) 512);   // 64-bit, so a huge number is capped, not wrapped
+    if (asked < marks + 1) {
+        return fail("bad_request", "max_tokens leaves no room for a text: it counts the model's own marks (" + std::to_string(marks) + ")");
+    }
+    if (marks + 1 > n_batch) {
+        return fail("bad_request", "--ctx is too small for one text");
+    }
+    const int limit = (int) std::min<int64_t>({asked, n_batch, llama_model_n_ctx_train(e.model)});
     json vectors = json::array(), counts = json::array();
     llama_batch b = llama_batch_init(n_batch, 0, 1);
     llama_memory_t mem = llama_get_memory(e.ctx);
@@ -416,9 +423,12 @@ static void embed(Engine & e, const json & req) {
             llama_batch_free(b);
             return fail("cancel", "stopped");
         }
-        llama_memory_clear(mem, true);             // no memory for BERT; for Gemma each pass starts empty
-        if (llama_decode(e.ctx, b) != 0) {         // llama_decode hands a model without memory (BERT) to its encoder itself
+        llama_memory_clear(mem, true);             // bge and EmbeddingGemma have no memory (b12032); one that has starts each pass empty
+        if (llama_decode(e.ctx, b) != 0) {         // llama_decode hands a model without memory to its encoder itself
             llama_batch_free(b);
+            if (e.in->cancel) {                    // stopped inside llama_decode by the abort callback
+                return fail("cancel", "stopped");
+            }
             return fail("decode", "the model could not read a text (llama_decode failed)");
         }
         for (int k = 0; k < s; k++) {
@@ -547,7 +557,7 @@ int main(int argc, char ** argv) {
         cp.embeddings = true;
         cp.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;   // the pooling the model file names: CLS for bge, mean for Gemma
         cp.n_batch = cp.n_ubatch = n_ctx;   // an embedding model reads each pass whole
-        cp.n_seq_max = 64;
+        cp.n_seq_max = std::min(64, n_ctx);   // no more texts per pass than tokens, or llama.cpp refuses the context
         cp.kv_unified = true;
     }
     static ggml_backend_dev_t no_devices[1] = { nullptr };
